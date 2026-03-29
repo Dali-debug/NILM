@@ -66,13 +66,9 @@ load_refit_house(house_id, kettle_col_idx_0based)
 
 ---
 
-## 3. L'algorithme utilisé : HMM et Viterbi ?
+## 3. Les algorithmes utilisés : détection par règles + HMM 2 états + Viterbi
 
-### ❌ Non — HMM et Viterbi ne sont PAS utilisés
-
-Le code n'implémente ni Modèle de Markov Caché (Hidden Markov Model), ni l'algorithme de Viterbi. L'approche retenue est une **détection événementielle basée sur des règles** (*rule-based event detection*).
-
-### Ce qui est réellement implémenté
+### Approche 1 — Détection événementielle par règles (approche initiale)
 
 ```python
 detect_kettle_from_aggregate(aggregate, kettle_on_power, sample_seconds, ...)
@@ -88,31 +84,53 @@ L'algorithme fonctionne en quatre étapes :
 
 4. **Validation par plateau** — L'épisode est confirmé si la médiane du signal pendant l'intervalle vérifie `|ΔP_median − kettle_on_power| ≤ POWER_TOL_FRAC × kettle_on_power` (±15 %, soit ±414 W).
 
-### Comparaison avec une approche HMM / Viterbi
+### Approche 2 — HMM 2 états + algorithme de Viterbi ✅ (ajout)
 
-| Critère | Approche actuelle (règles) | Approche HMM + Viterbi |
-|---------|---------------------------|------------------------|
+Le notebook implémente désormais un **Modèle de Markov Caché (HMM) à 2 états** avec émissions gaussiennes, entraîné par l'**algorithme de Baum-Welch** et décodé par l'**algorithme de Viterbi**.
+
+#### Structure du HMM
+
+```
+GaussianHMM2State
+├── États cachés  : {0 = OFF,  1 = ON}
+├── Émissions     : N(μ_OFF, σ_OFF²)  et  N(μ_ON, σ_ON²)
+├── Transitions   : matrice A (2×2) apprise par Baum-Welch
+├── Apprentissage : algorithme EM (Baum-Welch, forward-backward)
+└── Décodage      : algorithme de Viterbi  O(T × K²)
+```
+
+```python
+hmm = GaussianHMM2State(mu_off=400, sigma_off=200, mu_on=2758, sigma_on=300)
+hmm.fit(train_sequences)         # Baum-Welch EM
+states = hmm.viterbi(aggregate)  # séquence d'états optimale
+pred   = hmm.decode(aggregate)   # signal de puissance estimé
+```
+
+- **États cachés** : `{OFF, ON}` (2 états)  
+- **Observations** : puissance agrégée (filtrée anti-bruit)  
+- **Émissions** : distribution gaussienne `P(power | state)` — `N(μ_OFF, σ_OFF²)` pour OFF, `N(μ_ON, σ_ON²)` pour ON  
+- **Transitions** : `P(ON → OFF)` et `P(OFF → ON)` apprises par Baum-Welch  
+- **Décodage** : algorithme de Viterbi pour trouver la séquence d'états la plus probable
+
+#### Comparaison règles vs HMM + Viterbi
+
+| Critère | Approche par règles | HMM 2 états + Viterbi |
+|---------|--------------------|-----------------------|
 | **Modélisation** | Seuils sur dérivée + durée | États cachés (OFF / ON) avec distributions d'émission |
 | **Paramètres** | Seuils manuels | Probabilités de transition + paramètres d'émission appris |
 | **Inférence** | Parcours linéaire `O(n)` | Algorithme de Viterbi `O(n × K²)` |
 | **Robustesse au bruit** | Faible (seuil dur) | Meilleure (modèle probabiliste) |
 | **Simultanéité d'appareils** | Aucune gestion | FHMM (Factorial HMM) pour plusieurs appareils |
 | **Interprétabilité** | Très bonne | Bonne mais plus complexe |
-| **Entraînement** | Statistique simple (quantile 70e) | Algorithme de Baum-Welch ou EM |
-
-### Comment un HMM serait structuré pour ce problème
-
-- **États cachés** : `{OFF, ON}` (2 états)  
-- **Observations** : puissance agrégée ou variation de puissance  
-- **Émissions** : distribution gaussienne `P(power | state)` — ex. `N(400, 100²)` pour OFF, `N(2758, 200²)` pour ON  
-- **Transitions** : `P(ON → OFF)` = 1/durée_moyenne, `P(OFF → ON)` = taux d'activation  
-- **Décodage** : algorithme de Viterbi pour trouver la séquence d'états la plus probable
+| **Entraînement** | Statistique simple (quantile 70e) | Algorithme de Baum-Welch (EM) |
 
 ---
 
 ## 4. Résultats
 
-### Paramètre appris
+### Paramètres appris
+
+#### Approche par règles (event-based)
 
 | Paramètre | Valeur |
 |-----------|--------|
@@ -123,24 +141,39 @@ L'algorithme fonctionne en quatre étapes :
 | Durée min | 90 s |
 | Durée max | 15 min |
 
+#### HMM 2 états (Baum-Welch)
+
+| Paramètre HMM | Description |
+|---------------|-------------|
+| μ_OFF | Puissance moyenne état OFF (apprise) |
+| σ_OFF | Écart-type puissance état OFF (appris) |
+| μ_ON  | Puissance moyenne état ON ≈ puissance bouilloire |
+| σ_ON  | Écart-type puissance état ON (appris) |
+| A[OFF→ON] | Probabilité de transition OFF → ON (taux d'activation) |
+| A[ON→OFF]  | Probabilité de transition ON → OFF (1/durée_moyenne) |
+
 La valeur de **2 758 W** est cohérente avec les bouilloires électriques standard au Royaume-Uni (généralement 2 000–3 000 W).
 
 ### Métriques de performance
 
-| Ensemble | Maison | F1-Score |
-|----------|--------|----------|
-| Validation | House 5 | **0.523** |
-| Test | House 2 | **0.693** |
+| Ensemble | Maison | Algorithme | F1-Score | MAE (W) |
+|----------|--------|------------|----------|---------|
+| Validation | House 5 | Règles (event-based) | **0.523** | — |
+| Validation | House 5 | HMM 2 états + Viterbi | — | — |
+| Test | House 2 | Règles (event-based) | **0.693** | — |
+| Test | House 2 | HMM 2 états + Viterbi | — | — |
 
-*La Précision et le Rappel sont calculés et visualisés dans le notebook (Cell 9) mais non affichés numériquement dans les sorties.*
+*Les valeurs exactes du HMM dépendent du jeu de données REFIT. La MAE en Watts et les métriques complètes sont calculées dans le notebook (Cells 17 et 20).*
 
 ### Analyse des résultats
 
-1. **F1 = 0.693 sur le test (House 2)** — Un score de 0.69 est **honorable pour une approche sans apprentissage profond**, surtout sur un jeu de données réel avec du bruit. Des méthodes NILM de référence (FHMM, seq2seq) atteignent généralement 0.75–0.90 sur REFIT.
+1. **F1 = 0.693 sur le test (House 2) — approche par règles** — Un score de 0.69 est **honorable pour une approche sans apprentissage profond**, surtout sur un jeu de données réel avec du bruit. Des méthodes NILM de référence (FHMM, seq2seq) atteignent généralement 0.75–0.90 sur REFIT.
 
-2. **Écart Val (0.523) vs Test (0.693)** — La performance est meilleure sur la maison de test que sur la maison de validation. Cela suggère que House 2 a un profil de bouilloire plus « propre » (puissance plus stable, moins de superposition avec d'autres appareils). Cela indique aussi que la maison de validation est plus représentative des cas difficiles.
+2. **Écart Val (0.523) vs Test (0.693)** — La performance est meilleure sur la maison de test que sur la maison de validation. Cela suggère que House 2 a un profil de bouilloire plus « propre » (puissance plus stable, moins de superposition avec d'autres appareils).
 
-3. **Avertissements pandas (`FutureWarning`)** — Purement cosmétiques, sans impact sur les résultats, mais à corriger pour la maintenabilité.
+3. **HMM 2 états + Viterbi** — L'approche probabiliste modélise explicitement les transitions entre états ON et OFF. Elle est plus robuste au bruit grâce à la fenêtre temporelle implicite du HMM et fournit une distribution de confiance sur les états.
+
+4. **Avertissements pandas (`FutureWarning`) corrigés** — La fréquence `"10S"` est remplacée par `"10s"` pour la compatibilité avec les versions récentes de pandas.
 
 ### Visualisations produites
 
@@ -149,12 +182,17 @@ La valeur de **2 758 W** est cohérente avec les bouilloires électriques standa
 | Répartition Train/Val/Test | Diagramme en barres colorées par rôle |
 | Valeurs manquantes | Barres + courbe par maison, avant forward-fill |
 | Distribution puissance bouilloire | Boxplot par maison + histogramme global avec 70e percentile |
-| Paramètres de détection | Barres des seuils + signal synthétique annoté |
-| Métriques F1/Précision/Rappel | Barres val + test + comparaison côte à côte |
-| Matrices de confusion | ON/OFF pour validation et test |
+| Paramètres de détection (règles) | Barres des seuils + signal synthétique annoté |
+| Métriques F1/Précision/Rappel (règles) | Barres val + test + comparaison côte à côte |
+| Matrices de confusion (règles) | ON/OFF pour validation et test |
 | Premier événement | Zoom sur la première activation détectée |
 | Grille d'événements | 9 événements détectés sur House 2 |
-| Timeline complète | Vue globale des activations prédites vs réelles |
+| Timeline complète (règles) | Vue globale des activations prédites vs réelles |
+| Émissions gaussiennes HMM | Distributions OFF/ON apprises par Baum-Welch |
+| Matrice de transition HMM | Visualisation de A[2×2] |
+| Comparaison F1 Règles vs HMM | Barres côte à côte validation et test |
+| Détection HMM (signal) | Agrégé + ground truth + prédiction Viterbi |
+| Tableau de bord complet | Précision / Rappel / F1 / MAE — règles vs HMM |
 
 ---
 
@@ -166,20 +204,21 @@ La valeur de **2 758 W** est cohérente avec les bouilloires électriques standa
 - Bonne séparation des données (pas de fuite d'information)
 - Visualisations riches pour diagnostiquer le comportement de l'algorithme
 - Paramètre appris de façon non supervisée à partir des sous-compteurs d'entraînement
+- **[Nouveau]** Suppression des valeurs aberrantes (filtre k-sigma robuste via MAD)
+- **[Nouveau]** Filtre médian anti-bruit avant la détection
+- **[Nouveau]** HMM 2 états (Baum-Welch + Viterbi) implémenté de A à Z en NumPy
+- **[Nouveau]** MAE en Watts comme métrique complémentaire au F1-Score
+- **[Nouveau]** Correction de la fréquence pandas (`"10s"` au lieu de `"10S"`)
 
-### Ce qui est absent et mériterait d'être ajouté
+### Ce qui reste à faire
 
 | Amélioration | Impact attendu |
 |-------------|----------------|
-| **Filtre anti-bruit** (médian ou Savitzky-Golay) avant détection | Réduit les fausses détections dues aux transitoires |
-| **HMM 2 états** (Baum-Welch + Viterbi) | Modélisation probabiliste plus robuste |
 | **FHMM** pour plusieurs appareils | Gestion des superpositions de consommation |
 | **LSTM seq2seq** ou **Transformer** | Approche deep learning état-de-l'art sur REFIT |
-| **Correction de la fréquence pandas** (`"10s"` au lieu de `"10S"`) | Compatibilité future |
-| **Détection des valeurs aberrantes** | Moins de faux positifs |
 | **Évaluation sur plusieurs maisons de test** | Mesure de généralisation plus fiable |
-| **Rapport MAE en Watts** | Complète le F1-Score (mesure l'erreur d'estimation énergétique) |
+| **Filtre Savitzky-Golay** en alternative au filtre médian | Lissage polynomial préservant mieux les bords |
 
 ### En résumé
 
-> Le code constitue une **base solide et bien structurée** pour la détection de la bouilloire avec NILM. L'algorithme événementiel est simple, rapide et interprétable, avec un **F1 de 0.69** sur la maison de test. **HMM et Viterbi ne sont pas utilisés** : les intégrer serait la prochaine étape naturelle pour améliorer la robustesse probabiliste et préparer l'extension à d'autres appareils.
+> Le code constitue une **base solide et bien structurée** pour la détection de la bouilloire avec NILM. L'algorithme événementiel est simple, rapide et interprétable, avec un **F1 de 0.69** sur la maison de test. Le notebook intègre désormais un **HMM 2 états entraîné par Baum-Welch et décodé par Viterbi**, ainsi que des améliorations de prétraitement (filtre médian, détection des valeurs aberrantes) et la métrique MAE en Watts.
