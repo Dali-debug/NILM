@@ -54,7 +54,7 @@ load_refit_house(house_id, kettle_col_idx_0based)
 
 1. **Remplissage initial à 0 W** — Si les premières lignes sont manquantes (cas rare mais possible), remplir à 0 peut créer une fausse montée de puissance au début de la série et déclencher une fausse détection.
 
-2. **Absence de détection des valeurs aberrantes** — Aucun filtre pour les pics extrêmes (capteur défaillant, transitoire électrique) qui pourraient être confondus avec une mise en marche de bouilloire.
+2. **Absence de détection des valeurs aberrantes** — Aucun filtre pour les pics extrêmes (capteur défaillant, transitoire électrique) qui pourraient être confondus avec une mise en marche de bouilloire. → **Résolu** : filtre de Hampel ajouté (voir §2.1).
 
 3. **Absence de normalisation** — Non critique ici car l'algorithme travaille directement en Watts, mais une normalisation faciliterait une éventuelle généralisation à d'autres jeux de données.
 
@@ -63,6 +63,57 @@ load_refit_house(house_id, kettle_col_idx_0based)
 5. **Aucune exploration de corrélation Aggregate/Kettle** — Vérifier que le signal agrégé contient bien la signature de la bouilloire renforcerait la confiance dans les données.
 
 **Verdict** : Le preprocessing est **correct et suffisant pour une première approche**, mais manque de robustesse face aux valeurs aberrantes et nécessite une petite correction de syntaxe pandas.
+
+### 2.1 Filtre de Hampel ✅ (ajout)
+
+#### Qu'est-ce que le filtre de Hampel ?
+
+Le **filtre de Hampel** est un estimateur robuste de détection et remplacement d'outliers qui fonctionne dans une fenêtre glissante. Pour chaque point `x[t]` :
+
+1. Calcule la **médiane locale** `med` sur la fenêtre `[t-w, t+w]`
+2. Calcule le **MAD** (*Median Absolute Deviation*) de cette fenêtre : `MAD = médiane(|x - med|)`
+3. Estime l'écart-type robuste : `σ_mad = 1.4826 × MAD`
+4. Si `|x[t] - med| > k × σ_mad` → remplace `x[t]` par `med` (outlier détecté)
+5. Sinon → conserve `x[t]` inchangé (point normal)
+
+#### Pourquoi l'utiliser dans ce pipeline NILM ?
+
+| Problème | Solution Hampel |
+|----------|-----------------|
+| Pics capteur isolés (glitches électriques) | Détectés et remplacés par la médiane locale |
+| Bruit impulsionnel dans l'agrégat | Atténué avant le HMM/règles |
+| Préservation des vraies transitions (kettle ON/OFF) | Le plateau bouilloire dure plusieurs minutes → médiane locale reste haute → pas considéré comme outlier |
+
+#### Comment régler ses paramètres
+
+```python
+HAMPEL_WINDOW   = 10   # demi-fenêtre (pts) : fenêtre totale = 2×10+1 = 21 pts × 10s = 210s ≈ 3,5 min
+HAMPEL_N_SIGMAS = 3.0  # seuil k : 3.0 standard, 4.0–6.0 si on veut être plus permissif
+```
+
+| Paramètre | Valeur recommandée | Effet si trop petit | Effet si trop grand |
+|-----------|-------------------|---------------------|---------------------|
+| `window`  | 10–20 pts         | Médiane instable, faux remplacements | Intègre plusieurs événements, perd la localité |
+| `n_sigmas`| 3.0–4.0           | Écrase les vraies transitions (aggressive) | Laisse passer plus d'outliers |
+
+> **Règle pratique** : pour la bouilloire REFIT (plateau ≈ 2–3 kW, durée ≥ 90 s → ≥ 9 points à 10 s), utiliser `window=10` (≈ 3,5 min) et `n_sigmas=3.0`. La fenêtre est assez courte pour capturer les pics isolés mais assez longue pour que la médiane locale soit stable pendant un plateau bouilloire.
+
+#### Où est-il appliqué ?
+
+Le filtre est activé en **premier** dans `preprocess_aggregate()`, avant la détection des outliers globaux et le filtre médian :
+
+```python
+# Pipeline complet : Hampel → outliers globaux → filtre médian
+preprocess_aggregate(
+    aggregate,
+    apply_hampel=True,        # ← filtre de Hampel
+    hampel_window=10,
+    hampel_n_sigmas=3.0,
+    apply_outlier_removal=True,
+    apply_median_filter=True,
+    median_window=3
+)
+```
 
 ---
 
@@ -84,9 +135,13 @@ L'algorithme fonctionne en quatre étapes :
 
 4. **Validation par plateau** — L'épisode est confirmé si la médiane du signal pendant l'intervalle vérifie `|ΔP_median − kettle_on_power| ≤ POWER_TOL_FRAC × kettle_on_power` (±15 %, soit ±414 W).
 
-### Approche 2 — HMM 2 états + algorithme de Viterbi ✅ (ajout)
+### Approche 2 — HMM 2 états + algorithme de Viterbi ✅ (amélioré)
 
-Le notebook implémente désormais un **Modèle de Markov Caché (HMM) à 2 états** avec émissions gaussiennes, entraîné par l'**algorithme de Baum-Welch** et décodé par l'**algorithme de Viterbi**.
+Le notebook implémente un **Modèle de Markov Caché (HMM) à 2 états** avec émissions gaussiennes, entraîné par l'**algorithme de Baum-Welch** et décodé par l'**algorithme de Viterbi**. Trois améliorations clés ont été ajoutées par rapport à la version initiale :
+
+1. **Signal résiduel** comme observation (au lieu de l'agrégat brut)
+2. **Post-traitement** : suppression des segments ON trop courts
+3. **Filtre de Hampel** dans le prétraitement (voir §2.1)
 
 #### Structure du HMM
 
@@ -96,21 +151,64 @@ GaussianHMM2State
 ├── Émissions     : N(μ_OFF, σ_OFF²)  et  N(μ_ON, σ_ON²)
 ├── Transitions   : matrice A (2×2) apprise par Baum-Welch
 ├── Apprentissage : algorithme EM (Baum-Welch, forward-backward)
-└── Décodage      : algorithme de Viterbi  O(T × K²)
+├── Observation   : signal résiduel(t) = aggregate(t) - baseline(t)  ← NOUVEAU
+├── Décodage      : algorithme de Viterbi  O(T × K²)
+└── Post-traitement : suppression des segments ON < MIN_ON_SECONDS            ← NOUVEAU
 ```
 
 ```python
-hmm = GaussianHMM2State(mu_off=400, sigma_off=200, mu_on=2758, sigma_on=300)
-hmm.fit(train_sequences)         # Baum-Welch EM
-states = hmm.viterbi(aggregate)  # séquence d'états optimale
-pred   = hmm.decode(aggregate)   # signal de puissance estimé
+# Prétraitement avec Hampel
+agg_filtered = preprocess_aggregate(aggregate, apply_hampel=True)
+# Observation résiduelle
+obs = compute_hmm_observation(agg_filtered, baseline_window=60)
+# Entraînement
+hmm = GaussianHMM2State(mu_off=0, sigma_off=50, mu_on=2758, sigma_on=300)
+# Note: mu_off=0 car le résidu est clampé à max(0, ...) → l'état OFF vaut ~0 W
+#       (contrairement à l'agrégat brut où mu_off ≈ 400 W de consommation de fond)
+hmm.fit(train_sequences)            # Baum-Welch EM sur résidus
+# Décodage
+states = hmm.viterbi(obs)           # séquence d'états optimale
+states = postprocess_states(states) # supprime segments ON trop courts
+pred   = np.where(states == 1, hmm.mu[1], 0.0)
 ```
 
-- **États cachés** : `{OFF, ON}` (2 états)  
-- **Observations** : puissance agrégée (filtrée anti-bruit)  
-- **Émissions** : distribution gaussienne `P(power | state)` — `N(μ_OFF, σ_OFF²)` pour OFF, `N(μ_ON, σ_ON²)` pour ON  
-- **Transitions** : `P(ON → OFF)` et `P(OFF → ON)` apprises par Baum-Welch  
-- **Décodage** : algorithme de Viterbi pour trouver la séquence d'états la plus probable
+#### Nouvelle observation : signal résiduel
+
+**Problème avec l'agrégat brut** : l'agrégat contient la somme de *tous* les appareils. Avec seulement 2 états, le HMM tente de séparer "faible puissance" vs "forte puissance" dans l'agrégat entier, sans pouvoir distinguer une bouilloire allumée d'un four ou d'une machine à laver. Résultat : précision très faible et MAE élevée.
+
+**Solution — signal résiduel** :
+
+```
+residual(t) = max(0,  aggregate(t) − baseline(t))
+baseline(t) = médiane glissante(aggregate, fenêtre = 2 × 60 + 1 points = 10 min)
+```
+
+La baseline lente capture la consommation de fond (réfrigérateur, TV, éclairage) et les variations lentes d'autres appareils. Le résidu, lui, n'est élevé que lors de **hausses brutales et courtes** — exactement la signature de la bouilloire.
+
+| Signal | État OFF (HMM) | État ON (HMM) |
+|--------|---------------|--------------|
+| Agrégat brut | `N(μ_agg_off, σ_agg_off²)` — très variable | `N(μ_agg_on, σ_agg_on²)` — difficile à séparer |
+| **Résidu** | **≈ N(0, σ_noise²)** — stable près de 0 | **≈ N(kettle_power, σ_on²)** — pic net |
+
+Le résidu est clampé à 0 (`max(0, ...)`) pour éviter les valeurs négatives (liées aux baisses de consommation d'autres appareils).
+
+#### Paramètre de la baseline
+
+```python
+HMM_BASELINE_WINDOW = 60   # demi-fenêtre en points (60 × 10s = 10 min au total : 2×60+1 = 121 pts)
+```
+
+Ce paramètre contrôle à quelle vitesse la baseline peut suivre les variations lentes. Une fenêtre de 10 min est adaptée car :
+- La bouilloire chauffe en 2–10 min → la médiane sur 10 min inclut les deux états et se stabilise
+- Les variations lentes d'autres appareils (ex. chauffe-eau) évoluent sur > 10 min → capturées par la baseline
+
+#### Post-traitement des états
+
+Après le décodage Viterbi, les segments ON d'une durée inférieure à `HMM_MIN_ON_SECONDS` (90 s = 9 points) sont réinitialisés à OFF. Cette étape réduit les faux positifs causés par des pics résiduels brefs.
+
+```python
+HMM_MIN_ON_SECONDS = 90   # = MIN_ON_SECONDS (cohérent avec l'approche par règles)
+```
 
 #### Comparaison règles vs HMM + Viterbi
 
@@ -206,7 +304,10 @@ La valeur de **2 758 W** est cohérente avec les bouilloires électriques standa
 - Paramètre appris de façon non supervisée à partir des sous-compteurs d'entraînement
 - **[Nouveau]** Suppression des valeurs aberrantes (filtre k-sigma robuste via MAD)
 - **[Nouveau]** Filtre médian anti-bruit avant la détection
+- **[Nouveau]** **Filtre de Hampel** (médiane glissante + MAD glissante) pour les pics capteur isolés
 - **[Nouveau]** HMM 2 états (Baum-Welch + Viterbi) implémenté de A à Z en NumPy
+- **[Nouveau]** **Signal résiduel** (agrégat − baseline glissante) comme observation HMM — réduit les faux positifs
+- **[Nouveau]** **Post-traitement durée** des états HMM (suppression des segments ON trop courts)
 - **[Nouveau]** MAE en Watts comme métrique complémentaire au F1-Score
 - **[Nouveau]** Correction de la fréquence pandas (`"10s"` au lieu de `"10S"`)
 
@@ -221,4 +322,4 @@ La valeur de **2 758 W** est cohérente avec les bouilloires électriques standa
 
 ### En résumé
 
-> Le code constitue une **base solide et bien structurée** pour la détection de la bouilloire avec NILM. L'algorithme événementiel est simple, rapide et interprétable, avec un **F1 de 0.69** sur la maison de test. Le notebook intègre désormais un **HMM 2 états entraîné par Baum-Welch et décodé par Viterbi**, ainsi que des améliorations de prétraitement (filtre médian, détection des valeurs aberrantes) et la métrique MAE en Watts.
+> Le code constitue une **base solide et bien structurée** pour la détection de la bouilloire avec NILM. L'algorithme événementiel est simple, rapide et interprétable, avec un **F1 de 0.69** sur la maison de test. Le notebook intègre désormais un **HMM 2 états entraîné par Baum-Welch et décodé par Viterbi**, avec des améliorations significatives : **filtre de Hampel** pour les pics capteur, **signal résiduel** (agrégat − baseline) pour isoler la bouilloire des autres appareils, et **post-traitement durée** pour réduire les faux positifs. Les métriques Précision/Rappel/F1/MAE sont affichées pour les deux approches (règles et HMM) sur validation et test.
